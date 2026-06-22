@@ -31,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?);
     let rci_gateway = Arc::new(ReqwestRciGateway::new(
         config.rci_validation_url.clone(),
+        config.rci_typeahead_url.clone(),
         config.rci_resort_search_url.clone(),
         config.rci_all_inclusive_resorts_url.clone(),
         config.rci_all_inclusive_unit_types_url.clone(),

@@ -7,6 +7,7 @@ pub struct Config {
     pub redis_url: String,
     pub session_index_key: String,
     pub rci_validation_url: String,
+    pub rci_typeahead_url: String,
     pub rci_resort_search_url: String,
     pub rci_all_inclusive_resorts_url: String,
     pub rci_all_inclusive_unit_types_url: String,
@@ -27,6 +28,10 @@ impl Config {
             rci_validation_url: env_string(
                 "RCI_VALIDATION_URL",
                 "https://services.b2c.rci.com/ext/v1/jwt/validation",
+            ),
+            rci_typeahead_url: env_string(
+                "RCI_TYPEAHEAD_URL",
+                "https://services.b2c.rci.com/ext/v1/searchTypeahead/inventory/pt",
             ),
             rci_resort_search_url: env_string(
                 "RCI_RESORT_SEARCH_URL",

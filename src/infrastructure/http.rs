@@ -30,6 +30,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 pub struct ReqwestRciGateway {
     client: reqwest::Client,
     validation_url: String,
+    typeahead_url: String,
     resort_search_url: String,
     all_inclusive_resorts_url: String,
     all_inclusive_unit_types_url: String,
@@ -40,6 +41,7 @@ pub struct ReqwestRciGateway {
 impl ReqwestRciGateway {
     pub fn new(
         validation_url: String,
+        typeahead_url: String,
         resort_search_url: String,
         all_inclusive_resorts_url: String,
         all_inclusive_unit_types_url: String,
@@ -55,12 +57,58 @@ impl ReqwestRciGateway {
         Ok(Self {
             client,
             validation_url,
+            typeahead_url,
             resort_search_url,
             all_inclusive_resorts_url,
             all_inclusive_unit_types_url,
             all_inclusive_types_url,
             all_inclusive_billing_details_url,
         })
+    }
+
+    async fn resolve_destination_filter(
+        &self,
+        session: &AuthenticatedSession,
+        request: &ResortSearchRequest,
+        customer_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let mut url = reqwest::Url::parse(&self.typeahead_url)
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("Ntt", &format!("{}*", request.label.trim()))
+            .append_pair("consumerChannelQ", "Web")
+            .append_pair("memberTypeQ", "WEEKS")
+            .append_pair("operatorIdQ", "WEB00USER")
+            .append_pair("customerIdQ", customer_id);
+
+        let response = self
+            .client
+            .get(url)
+            .headers(build_rci_json_header_map(session)?)
+            .send()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+        let status = response.status().as_u16();
+
+        if status == 401 || status == 403 {
+            return Err(AppError::RciAuthFailed { status });
+        }
+        if !(200..300).contains(&status) {
+            return Err(AppError::RciUnexpectedStatus { status });
+        }
+
+        let body = response
+            .text()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+        let payload = serde_json::from_str::<Value>(&body).map_err(|err| {
+            AppError::RciUnavailable(format!(
+                "invalid typeahead response: {err}; body={}",
+                body.chars().take(500).collect::<String>()
+            ))
+        })?;
+
+        Ok(find_destination_filter(&payload, &request.label))
     }
 }
 
@@ -111,12 +159,30 @@ impl RciGateway for ReqwestRciGateway {
         request: &ResortSearchRequest,
     ) -> Result<RciResortSearchHttpResponse, AppError> {
         let customer_id = extract_customer_id(session)?;
+        let resolved_filter = if request
+            .filters
+            .as_ref()
+            .is_some_and(|filters| !filters.is_empty())
+        {
+            None
+        } else {
+            Some(
+                self.resolve_destination_filter(session, request, &customer_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::RciUnavailable(format!(
+                            "destination not found for label {}",
+                            request.label
+                        ))
+                    })?,
+            )
+        };
         let headers = build_rci_json_header_map(session)?;
         let url = format!(
             "{}?customerIdQ={}&appType=rcio&consumerChannelQ=Web&memberTypeQ=WEEKS&operatorIdQ=WEB00USER",
             self.resort_search_url, customer_id
         );
-        let body = build_resort_search_body(request, &customer_id);
+        let body = build_resort_search_body(request, &customer_id, resolved_filter);
 
         let response = self
             .client
@@ -545,11 +611,17 @@ fn normalize_unit_label(value: &str) -> String {
     lower
 }
 
-fn build_resort_search_body(request: &ResortSearchRequest, customer_id: &str) -> Value {
+fn build_resort_search_body(
+    request: &ResortSearchRequest,
+    customer_id: &str,
+    resolved_filter: Option<String>,
+) -> Value {
     let filters = request
         .filters
         .clone()
-        .unwrap_or_else(|| vec!["R1:13823|R2:13690|R3:13820|D:|C:12246".to_string()]);
+        .filter(|filters| !filters.is_empty())
+        .or_else(|| resolved_filter.map(|filter| vec![filter]))
+        .unwrap_or_default();
     let from = request.from.unwrap_or(0);
     let size = request.size.unwrap_or(16);
 
@@ -593,6 +665,61 @@ fn build_resort_search_body(request: &ResortSearchRequest, customer_id: &str) ->
         "searchNightlyRentalInvSelected": false,
         "selectedDepositTP": ""
     })
+}
+
+fn find_destination_filter(payload: &Value, requested_label: &str) -> Option<String> {
+    let normalized_requested = normalize_destination_label(requested_label);
+    let search_group = payload.get("searchGroup").unwrap_or(payload);
+    let groups = ["rciDictValues", "rciValues", "geocodeValues"];
+    let mut fallback = None;
+
+    for group in groups {
+        let Some(items) = search_group.get(group).and_then(Value::as_array) else {
+            continue;
+        };
+
+        for item in items {
+            let type_name = item
+                .get("typeName")
+                .or_else(|| item.get("searchType"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !type_name.eq_ignore_ascii_case("Dimension") {
+                continue;
+            }
+
+            let Some(value) = item
+                .get("value")
+                .or_else(|| item.get("xmlId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let label = item
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            if normalize_destination_label(label) == normalized_requested {
+                return Some(value.to_string());
+            }
+            if fallback.is_none() {
+                fallback = Some(value.to_string());
+            }
+        }
+    }
+
+    fallback
+}
+
+fn normalize_destination_label(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn extract_customer_id(session: &AuthenticatedSession) -> Result<String, AppError> {

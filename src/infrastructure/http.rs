@@ -27,10 +27,11 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
+const BRAZIL_SEARCH_FILTER: &str = "R1:13823|R2:13690|R3:|D:|C:";
+
 pub struct ReqwestRciGateway {
     client: reqwest::Client,
     validation_url: String,
-    typeahead_url: String,
     resort_search_url: String,
     all_inclusive_resorts_url: String,
     all_inclusive_unit_types_url: String,
@@ -41,7 +42,6 @@ pub struct ReqwestRciGateway {
 impl ReqwestRciGateway {
     pub fn new(
         validation_url: String,
-        typeahead_url: String,
         resort_search_url: String,
         all_inclusive_resorts_url: String,
         all_inclusive_unit_types_url: String,
@@ -57,58 +57,12 @@ impl ReqwestRciGateway {
         Ok(Self {
             client,
             validation_url,
-            typeahead_url,
             resort_search_url,
             all_inclusive_resorts_url,
             all_inclusive_unit_types_url,
             all_inclusive_types_url,
             all_inclusive_billing_details_url,
         })
-    }
-
-    async fn resolve_destination_filter(
-        &self,
-        session: &AuthenticatedSession,
-        request: &ResortSearchRequest,
-        customer_id: &str,
-    ) -> Result<Option<String>, AppError> {
-        let mut url = reqwest::Url::parse(&self.typeahead_url)
-            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("Ntt", &format!("{}*", request.label.trim()))
-            .append_pair("consumerChannelQ", "Web")
-            .append_pair("memberTypeQ", "WEEKS")
-            .append_pair("operatorIdQ", "WEB00USER")
-            .append_pair("customerIdQ", customer_id);
-
-        let response = self
-            .client
-            .get(url)
-            .headers(build_rci_json_header_map(session)?)
-            .send()
-            .await
-            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
-        let status = response.status().as_u16();
-
-        if status == 401 || status == 403 {
-            return Err(AppError::RciAuthFailed { status });
-        }
-        if !(200..300).contains(&status) {
-            return Err(AppError::RciUnexpectedStatus { status });
-        }
-
-        let body = response
-            .text()
-            .await
-            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
-        let payload = serde_json::from_str::<Value>(&body).map_err(|err| {
-            AppError::RciUnavailable(format!(
-                "invalid typeahead response: {err}; body={}",
-                body.chars().take(500).collect::<String>()
-            ))
-        })?;
-
-        Ok(find_destination_filter(&payload, &request.label))
     }
 }
 
@@ -159,30 +113,16 @@ impl RciGateway for ReqwestRciGateway {
         request: &ResortSearchRequest,
     ) -> Result<RciResortSearchHttpResponse, AppError> {
         let customer_id = extract_customer_id(session)?;
-        let resolved_filter = if request
+        let should_filter_by_label = request
             .filters
             .as_ref()
-            .is_some_and(|filters| !filters.is_empty())
-        {
-            None
-        } else {
-            Some(
-                self.resolve_destination_filter(session, request, &customer_id)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::RciUnavailable(format!(
-                            "destination not found for label {}",
-                            request.label
-                        ))
-                    })?,
-            )
-        };
+            .is_none_or(|filters| filters.is_empty());
         let headers = build_rci_json_header_map(session)?;
         let url = format!(
             "{}?customerIdQ={}&appType=rcio&consumerChannelQ=Web&memberTypeQ=WEEKS&operatorIdQ=WEB00USER",
             self.resort_search_url, customer_id
         );
-        let body = build_resort_search_body(request, &customer_id, resolved_filter);
+        let body = build_resort_search_body(request, &customer_id);
 
         let response = self
             .client
@@ -208,10 +148,14 @@ impl RciGateway for ReqwestRciGateway {
             });
         }
 
-        let payload = response
+        let mut payload = response
             .json::<Value>()
             .await
             .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        if should_filter_by_label {
+            filter_resorts_by_label(&mut payload, &request.label);
+        }
 
         Ok(RciResortSearchHttpResponse {
             status,
@@ -611,17 +555,12 @@ fn normalize_unit_label(value: &str) -> String {
     lower
 }
 
-fn build_resort_search_body(
-    request: &ResortSearchRequest,
-    customer_id: &str,
-    resolved_filter: Option<String>,
-) -> Value {
+fn build_resort_search_body(request: &ResortSearchRequest, customer_id: &str) -> Value {
     let filters = request
         .filters
         .clone()
         .filter(|filters| !filters.is_empty())
-        .or_else(|| resolved_filter.map(|filter| vec![filter]))
-        .unwrap_or_default();
+        .unwrap_or_else(|| vec![BRAZIL_SEARCH_FILTER.to_string()]);
     let from = request.from.unwrap_or(0);
     let size = request.size.unwrap_or(16);
 
@@ -667,59 +606,120 @@ fn build_resort_search_body(
     })
 }
 
-fn find_destination_filter(payload: &Value, requested_label: &str) -> Option<String> {
-    let normalized_requested = normalize_destination_label(requested_label);
-    let search_group = payload.get("searchGroup").unwrap_or(payload);
-    let groups = ["rciDictValues", "rciValues", "geocodeValues"];
-    let mut fallback = None;
+fn normalize_destination_label(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'á' | 'à' | 'â' | 'ã' | 'ä' | 'Á' | 'À' | 'Â' | 'Ã' | 'Ä' => 'a',
+            'é' | 'è' | 'ê' | 'ë' | 'É' | 'È' | 'Ê' | 'Ë' => 'e',
+            'í' | 'ì' | 'î' | 'ï' | 'Í' | 'Ì' | 'Î' | 'Ï' => 'i',
+            'ó' | 'ò' | 'ô' | 'õ' | 'ö' | 'Ó' | 'Ò' | 'Ô' | 'Õ' | 'Ö' => 'o',
+            'ú' | 'ù' | 'û' | 'ü' | 'Ú' | 'Ù' | 'Û' | 'Ü' => 'u',
+            'ç' | 'Ç' => 'c',
+            other => other.to_ascii_lowercase(),
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
-    for group in groups {
-        let Some(items) = search_group.get(group).and_then(Value::as_array) else {
-            continue;
-        };
+fn brazilian_state_code(label: &str) -> Option<&'static str> {
+    match normalize_destination_label(label).as_str() {
+        "acre" => Some("AC"),
+        "alagoas" => Some("AL"),
+        "amapa" => Some("AP"),
+        "amazonas" => Some("AM"),
+        "bahia" => Some("BA"),
+        "ceara" => Some("CE"),
+        "distrito federal" | "brasilia" => Some("DF"),
+        "espirito santo" => Some("ES"),
+        "goias" => Some("GO"),
+        "maranhao" => Some("MA"),
+        "mato grosso" => Some("MT"),
+        "mato grosso do sul" => Some("MS"),
+        "minas gerais" => Some("MG"),
+        "para" => Some("PA"),
+        "paraiba" => Some("PB"),
+        "parana" => Some("PR"),
+        "pernambuco" => Some("PE"),
+        "piaui" => Some("PI"),
+        "rio de janeiro" => Some("RJ"),
+        "rio grande do norte" => Some("RN"),
+        "rio grande do sul" => Some("RS"),
+        "rondonia" => Some("RO"),
+        "roraima" => Some("RR"),
+        "santa catarina" => Some("SC"),
+        "sao paulo" => Some("SP"),
+        "sergipe" => Some("SE"),
+        "tocantins" => Some("TO"),
+        _ => None,
+    }
+}
 
-        for item in items {
-            let type_name = item
-                .get("typeName")
-                .or_else(|| item.get("searchType"))
+fn resort_matches_label(resort: &Value, label: &str) -> bool {
+    let normalized_label = normalize_destination_label(label);
+    if normalized_label.is_empty() {
+        return false;
+    }
+
+    let state_code = brazilian_state_code(label);
+    let addresses = resort
+        .get("contact")
+        .and_then(|contact| contact.get("addresses"))
+        .and_then(Value::as_array);
+
+    if let Some(addresses) = addresses {
+        for address in addresses {
+            let state = address
+                .get("state")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !type_name.eq_ignore_ascii_case("Dimension") {
-                continue;
+            if state_code.is_some_and(|code| state.eq_ignore_ascii_case(code)) {
+                return true;
             }
 
-            let Some(value) = item
-                .get("value")
-                .or_else(|| item.get("xmlId"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let label = item
-                .get("label")
+            let city = address
+                .get("city")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-
-            if normalize_destination_label(label) == normalized_requested {
-                return Some(value.to_string());
-            }
-            if fallback.is_none() {
-                fallback = Some(value.to_string());
+            if normalize_destination_label(city).contains(&normalized_label) {
+                return true;
             }
         }
     }
 
-    fallback
+    resort
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| normalize_destination_label(name).contains(&normalized_label))
 }
 
-fn normalize_destination_label(value: &str) -> String {
-    value
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+fn filter_resorts_by_label(payload: &mut Value, label: &str) {
+    let Some(resorts) = payload
+        .get_mut("availableResorts")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+
+    resorts.retain(|resort| resort_matches_label(resort, label));
+    let resort_count = resorts.len() as u64;
+    let inventory_count = resorts
+        .iter()
+        .filter_map(|resort| resort.get("availableUnitCount").and_then(Value::as_u64))
+        .sum::<u64>();
+
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "availableResortCount".to_string(),
+            Value::from(resort_count),
+        );
+        object.insert(
+            "availableInventoryCount".to_string(),
+            Value::from(inventory_count),
+        );
+    }
 }
 
 fn extract_customer_id(session: &AuthenticatedSession) -> Result<String, AppError> {
@@ -730,15 +730,15 @@ fn extract_customer_id(session: &AuthenticatedSession) -> Result<String, AppErro
         .map(|(_, value)| value.as_str())
         .unwrap_or_default();
 
-    if let Some(value) = extract_cookie_value(cookie, "__attentive_client_user_id") {
-        if !value.is_empty() {
-            return Ok(value);
-        }
-    }
-
     if let Some(value) = extract_cookie_value(cookie, "USER_INFO") {
         if let Some(member_id) = extract_member_id_from_user_info_cookie(&value) {
             return Ok(member_id);
+        }
+    }
+
+    if let Some(value) = extract_cookie_value(cookie, "__attentive_client_user_id") {
+        if !value.is_empty() {
+            return Ok(value);
         }
     }
 
@@ -865,4 +865,63 @@ impl RawValidationPayload {
 
 fn empty_string_to_none(value: Option<String>) -> Option<String> {
     value.and_then(|value| if value.is_empty() { None } else { Some(value) })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{filter_resorts_by_label, normalize_destination_label};
+
+    fn resort(name: &str, city: &str, state: &str, units: u64) -> serde_json::Value {
+        json!({
+            "name": name,
+            "availableUnitCount": units,
+            "contact": {
+                "addresses": [{"city": city, "state": state, "country": "Brazil"}]
+            }
+        })
+    }
+
+    #[test]
+    fn normalizes_portuguese_accents() {
+        assert_eq!(
+            normalize_destination_label("  São   Sebastião  "),
+            "sao sebastiao"
+        );
+    }
+
+    #[test]
+    fn filters_city_without_reusing_gramado() {
+        let mut payload = json!({
+            "availableResortCount": 3,
+            "availableInventoryCount": 10,
+            "availableResorts": [
+                resort("Resort Gramado", "Gramado", "RS", 2),
+                resort("Resort Bahia", "Porto Seguro", "BA", 5),
+                resort("Resort Rio", "Rio de Janeiro", "RJ", 3)
+            ]
+        });
+
+        filter_resorts_by_label(&mut payload, "Bahia");
+
+        assert_eq!(payload["availableResortCount"], 1);
+        assert_eq!(payload["availableInventoryCount"], 5);
+        assert_eq!(payload["availableResorts"][0]["name"], "Resort Bahia");
+    }
+
+    #[test]
+    fn filters_exact_city_with_accent_insensitive_match() {
+        let mut payload = json!({
+            "availableResorts": [
+                resort("Resort Búzios", "Búzios", "RJ", 4),
+                resort("Resort Gramado", "Gramado", "RS", 2)
+            ]
+        });
+
+        filter_resorts_by_label(&mut payload, "Buzios");
+
+        assert_eq!(payload["availableResortCount"], 1);
+        assert_eq!(payload["availableResorts"][0]["name"], "Resort Búzios");
+    }
 }

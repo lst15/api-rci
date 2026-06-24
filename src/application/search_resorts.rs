@@ -92,7 +92,9 @@ mod tests {
     use super::*;
     use crate::domain::models::{
         AllInclusiveQuoteHttpResponse, AllInclusiveQuoteRequest, AllInclusiveResortsHttpResponse,
-        AuthenticatedSession, RciResortSearchHttpResponse, RciValidationHttpResponse,
+        AuthenticatedSession, RciResortDetailsHttpResponse, RciResortPackagesHttpResponse,
+        RciResortSearchHttpResponse, RciValidationHttpResponse, ResortDetailsRequest,
+        ResortPackagesRequest,
     };
 
     struct FakeSessionRepository {
@@ -125,6 +127,22 @@ mod tests {
             _request: &ResortSearchRequest,
         ) -> Result<RciResortSearchHttpResponse, AppError> {
             Ok(self.responses.lock().unwrap().pop_front().unwrap())
+        }
+
+        async fn resort_details(
+            &self,
+            _session: &AuthenticatedSession,
+            _request: &ResortDetailsRequest,
+        ) -> Result<RciResortDetailsHttpResponse, AppError> {
+            unreachable!()
+        }
+
+        async fn resort_packages(
+            &self,
+            _session: &AuthenticatedSession,
+            _request: &ResortPackagesRequest,
+        ) -> Result<RciResortPackagesHttpResponse, AppError> {
+            unreachable!()
         }
 
         async fn list_all_inclusive_resorts(

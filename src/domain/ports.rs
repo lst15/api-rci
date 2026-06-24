@@ -3,8 +3,9 @@ use async_trait::async_trait;
 use crate::domain::errors::AppError;
 use crate::domain::models::{
     AllInclusiveQuoteHttpResponse, AllInclusiveQuoteRequest, AllInclusiveResortsHttpResponse,
-    AuthenticatedSession, RciResortSearchHttpResponse, RciValidationHttpResponse,
-    ResortSearchRequest,
+    AuthenticatedSession, RciResortDetailsHttpResponse, RciResortPackagesHttpResponse,
+    RciResortSearchHttpResponse, RciValidationHttpResponse, ResortDetailsRequest,
+    ResortPackagesRequest, ResortSearchRequest,
 };
 
 #[async_trait]
@@ -24,6 +25,18 @@ pub trait RciGateway: Send + Sync {
         session: &AuthenticatedSession,
         request: &ResortSearchRequest,
     ) -> Result<RciResortSearchHttpResponse, AppError>;
+
+    async fn resort_details(
+        &self,
+        session: &AuthenticatedSession,
+        request: &ResortDetailsRequest,
+    ) -> Result<RciResortDetailsHttpResponse, AppError>;
+
+    async fn resort_packages(
+        &self,
+        session: &AuthenticatedSession,
+        request: &ResortPackagesRequest,
+    ) -> Result<RciResortPackagesHttpResponse, AppError>;
 
     async fn list_all_inclusive_resorts(&self)
         -> Result<AllInclusiveResortsHttpResponse, AppError>;

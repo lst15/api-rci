@@ -53,8 +53,58 @@ pub struct RciResortSearchHttpResponse {
     pub payload: Option<Value>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ResortDetailsRequest {
+    #[serde(rename = "resortCode")]
+    pub resort_code: String,
+    #[serde(default)]
+    pub locale: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RciResortDetailsHttpResponse {
+    pub status: u16,
+    pub payload: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ResortPackagesRequest {
+    #[serde(rename = "resortCode")]
+    pub resort_code: String,
+    #[serde(default, rename = "minStartDate")]
+    pub min_start_date: Option<String>,
+    #[serde(default, rename = "maxStartDate")]
+    pub max_start_date: Option<String>,
+    #[serde(default, rename = "productType")]
+    pub product_type: Option<String>,
+    #[serde(default, rename = "minLoS")]
+    pub min_los: Option<u32>,
+    #[serde(default, rename = "maxLoS")]
+    pub max_los: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RciResortPackagesHttpResponse {
+    pub status: u16,
+    pub payload: Option<Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ResortSearchResult {
+    pub username: String,
+    pub rci_status: u16,
+    pub data: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResortDetailsResult {
+    pub username: String,
+    pub rci_status: u16,
+    pub data: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ResortPackagesResult {
     pub username: String,
     pub rci_status: u16,
     pub data: Value,

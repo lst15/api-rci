@@ -107,8 +107,9 @@ mod tests {
     use super::*;
     use crate::domain::models::{
         AllInclusiveQuoteHttpResponse, AllInclusiveQuoteRequest, AllInclusiveResortsHttpResponse,
-        AuthenticatedSession, RciResortSearchHttpResponse, RciValidationPayload,
-        ResortSearchRequest,
+        AuthenticatedSession, RciResortDetailsHttpResponse, RciResortPackagesHttpResponse,
+        RciResortSearchHttpResponse, RciValidationPayload, ResortDetailsRequest,
+        ResortPackagesRequest, ResortSearchRequest,
     };
 
     struct FakeSessionRepository {
@@ -156,6 +157,22 @@ mod tests {
             _session: &AuthenticatedSession,
             _request: &ResortSearchRequest,
         ) -> Result<RciResortSearchHttpResponse, AppError> {
+            unreachable!()
+        }
+
+        async fn resort_details(
+            &self,
+            _session: &AuthenticatedSession,
+            _request: &ResortDetailsRequest,
+        ) -> Result<RciResortDetailsHttpResponse, AppError> {
+            unreachable!()
+        }
+
+        async fn resort_packages(
+            &self,
+            _session: &AuthenticatedSession,
+            _request: &ResortPackagesRequest,
+        ) -> Result<RciResortPackagesHttpResponse, AppError> {
             unreachable!()
         }
 

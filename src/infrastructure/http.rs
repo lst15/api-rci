@@ -2,15 +2,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
-use reqwest::header::HeaderMap;
+use reqwest::{header::HeaderMap, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::domain::errors::AppError;
 use crate::domain::models::{
     AllInclusiveQuote, AllInclusiveQuoteHttpResponse, AllInclusiveQuoteRequest, AllInclusiveResort,
-    AllInclusiveResortsHttpResponse, AuthenticatedSession, RciResortSearchHttpResponse,
-    RciValidationHttpResponse, RciValidationPayload, ResortSearchRequest,
+    AllInclusiveResortsHttpResponse, AuthenticatedSession, RciResortDetailsHttpResponse,
+    RciResortPackagesHttpResponse, RciResortSearchHttpResponse, RciValidationHttpResponse,
+    RciValidationPayload, ResortDetailsRequest, ResortPackagesRequest, ResortSearchRequest,
 };
 use crate::domain::ports::RciGateway;
 
@@ -28,11 +29,23 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 ];
 
 const BRAZIL_SEARCH_FILTER: &str = "R1:13823|R2:13690|R3:|D:|C:";
+const DEFAULT_LOCALE: &str = "pt_BR";
+const DEFAULT_CONSUMER_CHANNEL: &str = "Web";
+const DEFAULT_MEMBER_TYPE_WEEKS: &str = "WEEKS";
+const DEFAULT_MEMBER_TYPE_POINTS: &str = "POINTS";
+const DEFAULT_OPERATOR_ID_WEEKS: &str = "WEBUSER001";
+const DEFAULT_OPERATOR_ID_POINTS: &str = "WEB00USER";
+const RCI_ORIGIN: &str = "https://www.rci.com";
+const RCI_PRELOGIN_REFERER: &str = "https://www.rci.com/pre-rci/br/pt/resort-directory/landing";
+const RCI_PRELOGIN_SIGNATURE_URL: &str =
+    "https://services.b2c.rci.com/ext/v1/prelogin/signature?ConsumerChannel=Web&OperatorId=WEBUSER001";
+const RCI_PRELOGIN_HEADER: &str = "rci-prelogin";
 
 pub struct ReqwestRciGateway {
     client: reqwest::Client,
     validation_url: String,
     resort_search_url: String,
+    resort_details_base_url: String,
     all_inclusive_resorts_url: String,
     all_inclusive_unit_types_url: String,
     all_inclusive_types_url: String,
@@ -43,6 +56,7 @@ impl ReqwestRciGateway {
     pub fn new(
         validation_url: String,
         resort_search_url: String,
+        resort_details_base_url: String,
         all_inclusive_resorts_url: String,
         all_inclusive_unit_types_url: String,
         all_inclusive_types_url: String,
@@ -58,6 +72,7 @@ impl ReqwestRciGateway {
             client,
             validation_url,
             resort_search_url,
+            resort_details_base_url,
             all_inclusive_resorts_url,
             all_inclusive_unit_types_url,
             all_inclusive_types_url,
@@ -158,6 +173,200 @@ impl RciGateway for ReqwestRciGateway {
         }
 
         Ok(RciResortSearchHttpResponse {
+            status,
+            payload: Some(payload),
+        })
+    }
+
+    async fn resort_details(
+        &self,
+        _session: &AuthenticatedSession,
+        request: &ResortDetailsRequest,
+    ) -> Result<RciResortDetailsHttpResponse, AppError> {
+        let resort_code = request.resort_code.trim().to_ascii_uppercase();
+        if resort_code.is_empty() {
+            return Err(AppError::RciUnavailable("missing resort code".into()));
+        }
+
+        let locale = request
+            .locale
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_LOCALE);
+        let headers = self.build_rci_prelogin_header_map().await?;
+
+        let details_url = build_resort_details_collection_url(&self.resort_details_base_url)?;
+        let details_body = json!({
+            "locale": locale,
+            "resortCodes": [resort_code.as_str()],
+        });
+        let unit_details_url = build_resort_details_item_url(
+            &self.resort_details_base_url,
+            &resort_code,
+            "unit-details",
+            Some(locale),
+            DEFAULT_MEMBER_TYPE_POINTS,
+            DEFAULT_OPERATOR_ID_POINTS,
+        )?;
+        let images_url = build_resort_details_item_url(
+            &self.resort_details_base_url,
+            &resort_code,
+            "images",
+            None,
+            DEFAULT_MEMBER_TYPE_WEEKS,
+            DEFAULT_OPERATOR_ID_WEEKS,
+        )?;
+        let urgent_info_url = build_resort_details_item_url(
+            &self.resort_details_base_url,
+            &resort_code,
+            "urgent-info",
+            Some(locale),
+            DEFAULT_MEMBER_TYPE_POINTS,
+            DEFAULT_OPERATOR_ID_POINTS,
+        )?;
+        let additional_details_url = build_resort_details_item_url(
+            &self.resort_details_base_url,
+            &resort_code,
+            "additional-details",
+            Some(locale),
+            DEFAULT_MEMBER_TYPE_POINTS,
+            DEFAULT_OPERATOR_ID_POINTS,
+        )?;
+        let vacation_types_url = build_resort_details_item_url(
+            &self.resort_details_base_url,
+            &resort_code,
+            "vacation-types",
+            None,
+            DEFAULT_MEMBER_TYPE_WEEKS,
+            DEFAULT_OPERATOR_ID_WEEKS,
+        )?;
+
+        let (
+            details_response,
+            unit_details_response,
+            images_response,
+            urgent_info_response,
+            additional_details_response,
+            vacation_types_response,
+        ) = tokio::try_join!(
+            self.post_rci_json(details_url, headers.clone(), details_body),
+            self.get_rci_json(unit_details_url, headers.clone()),
+            self.get_rci_json(images_url, headers.clone()),
+            self.get_rci_json(urgent_info_url, headers.clone()),
+            self.get_rci_json(additional_details_url, headers.clone()),
+            self.get_rci_json(vacation_types_url, headers),
+        )?;
+
+        let responses = [
+            &details_response,
+            &unit_details_response,
+            &images_response,
+            &urgent_info_response,
+            &additional_details_response,
+            &vacation_types_response,
+        ];
+
+        if let Some(response) = responses
+            .iter()
+            .copied()
+            .find(|response| response.status == 401 || response.status == 403)
+        {
+            return Ok(RciResortDetailsHttpResponse {
+                status: response.status,
+                payload: None,
+            });
+        }
+
+        let has_any_payload = responses
+            .iter()
+            .copied()
+            .any(|response| response.payload.is_some());
+
+        if !has_any_payload {
+            let response = responses
+                .iter()
+                .copied()
+                .find(|response| !(200..300).contains(&response.status))
+                .unwrap_or(&details_response);
+            return Ok(RciResortDetailsHttpResponse {
+                status: response.status,
+                payload: None,
+            });
+        }
+
+        let images_payload = images_response.payload.clone().unwrap_or(Value::Null);
+        let mut resort_details = details_response.payload.unwrap_or(Value::Null);
+        inject_images_into_resort_details(&mut resort_details, images_payload.clone());
+
+        let payload = json!({
+            "resortDetails": resort_details,
+            "images": images_payload,
+            "urgentInfo": urgent_info_response.payload.unwrap_or(Value::Null),
+            "unitDetails": unit_details_response.payload.unwrap_or(Value::Null),
+            "vacationTypes": vacation_types_response.payload.unwrap_or(Value::Null),
+            "additionalDetails": additional_details_response.payload.unwrap_or(Value::Null),
+            "_meta": {
+                "resortCode": resort_code,
+                "locale": locale,
+                "upstreamStatuses": {
+                    "resortDetails": details_response.status,
+                    "unitDetails": unit_details_response.status,
+                    "images": images_response.status,
+                    "urgentInfo": urgent_info_response.status,
+                    "additionalDetails": additional_details_response.status,
+                    "vacationTypes": vacation_types_response.status,
+                }
+            },
+        });
+
+        Ok(RciResortDetailsHttpResponse {
+            status: 200,
+            payload: Some(payload),
+        })
+    }
+
+    async fn resort_packages(
+        &self,
+        session: &AuthenticatedSession,
+        request: &ResortPackagesRequest,
+    ) -> Result<RciResortPackagesHttpResponse, AppError> {
+        let customer_id = extract_customer_id(session)?;
+        let resort_code = request.resort_code.trim().to_ascii_uppercase();
+        if resort_code.is_empty() {
+            return Err(AppError::RciUnavailable("missing resort code".into()));
+        }
+
+        let headers = build_rci_json_header_map(session)?;
+        let url = format!(
+            "{}?customerIdQ={}&appType=rcio&consumerChannelQ=Web&memberTypeQ=WEEKS&operatorIdQ=WEB00USER",
+            self.resort_search_url, customer_id
+        );
+        let body = build_resort_packages_body(request, &customer_id, &resort_code);
+
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        let status = response.status().as_u16();
+        if status == 401 || status == 403 || !(200..300).contains(&status) {
+            return Ok(RciResortPackagesHttpResponse {
+                status,
+                payload: None,
+            });
+        }
+
+        let payload = response
+            .json::<Value>()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        Ok(RciResortPackagesHttpResponse {
             status,
             payload: Some(payload),
         })
@@ -338,6 +547,292 @@ impl RciGateway for ReqwestRciGateway {
             }),
         })
     }
+}
+
+#[derive(Debug)]
+struct RciJsonResponse {
+    status: u16,
+    payload: Option<Value>,
+}
+
+impl ReqwestRciGateway {
+    async fn build_rci_prelogin_header_map(&self) -> Result<HeaderMap, AppError> {
+        let seed_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        let seed_response = seed_client
+            .get(format!("{RCI_ORIGIN}/"))
+            .send()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        let mut cookies = Vec::new();
+        for value in &seed_response.headers().get_all("set-cookie") {
+            let Some(raw) = value.to_str().ok() else {
+                continue;
+            };
+            let Some((name, val)) = parse_set_cookie(raw) else {
+                continue;
+            };
+            cookies.push(format!("{name}={val}"));
+        }
+
+        let csrf_token = seed_response
+            .headers()
+            .get("csrftoken")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| {
+                cookies.iter().find_map(|cookie| {
+                    let (name, value) = cookie.split_once('=')?;
+                    if name == "csrfToken" {
+                        Some(value.to_string())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .ok_or_else(|| AppError::RciUnavailable("missing RCI prelogin csrf token".into()))?;
+
+        let bootstrap_cookie_header = cookies.join("; ");
+        if bootstrap_cookie_header.is_empty() {
+            return Err(AppError::RciUnavailable(
+                "missing RCI prelogin bootstrap cookies".into(),
+            ));
+        }
+
+        let signature_response = self
+            .client
+            .post(RCI_PRELOGIN_SIGNATURE_URL)
+            .header("accept", &csrf_token)
+            .header("prelogin", RCI_PRELOGIN_HEADER)
+            .header("origin", RCI_ORIGIN)
+            .header("referer", RCI_PRELOGIN_REFERER)
+            .header("cookie", &bootstrap_cookie_header)
+            .header("content-type", "text/plain")
+            .body("{}")
+            .send()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        if !signature_response.status().is_success() {
+            return Err(AppError::RciUnexpectedStatus {
+                status: signature_response.status().as_u16(),
+            });
+        }
+
+        let mut access_token = None;
+        let mut refresh_token = None;
+        for value in &signature_response.headers().get_all("set-cookie") {
+            let Some(raw) = value.to_str().ok() else {
+                continue;
+            };
+            let Some((name, val)) = parse_set_cookie(raw) else {
+                continue;
+            };
+            if name == "access_token" {
+                access_token = Some(val);
+            } else if name == "refresh_token" {
+                refresh_token = Some(val);
+            }
+        }
+
+        let access_token = access_token
+            .ok_or_else(|| AppError::RciUnavailable("missing RCI prelogin access_token".into()))?;
+        let refresh_token = refresh_token
+            .ok_or_else(|| AppError::RciUnavailable("missing RCI prelogin refresh_token".into()))?;
+        let cookie_header = format!(
+            "{bootstrap_cookie_header}; access_token={access_token}; refresh_token={refresh_token}"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_str(&format!("gateway-token={access_token};")).map_err(|err| {
+                AppError::RciUnavailable(format!("invalid RCI prelogin accept header: {err}"))
+            })?,
+        );
+        headers.insert(
+            http::header::COOKIE,
+            HeaderValue::from_str(&cookie_header).map_err(|err| {
+                AppError::RciUnavailable(format!("invalid RCI prelogin cookie header: {err}"))
+            })?,
+        );
+        headers.insert(http::header::ORIGIN, HeaderValue::from_static(RCI_ORIGIN));
+        headers.insert(
+            http::header::REFERER,
+            HeaderValue::from_static(RCI_PRELOGIN_REFERER),
+        );
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("same-site"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-mode"),
+            HeaderValue::from_static("cors"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-dest"),
+            HeaderValue::from_static("empty"),
+        );
+
+        Ok(headers)
+    }
+
+    async fn get_rci_json(
+        &self,
+        url: String,
+        headers: HeaderMap,
+    ) -> Result<RciJsonResponse, AppError> {
+        let response = self
+            .client
+            .get(url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        parse_json_response(response).await
+    }
+
+    async fn post_rci_json(
+        &self,
+        url: String,
+        headers: HeaderMap,
+        body: Value,
+    ) -> Result<RciJsonResponse, AppError> {
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+        parse_json_response(response).await
+    }
+}
+
+async fn parse_json_response(response: reqwest::Response) -> Result<RciJsonResponse, AppError> {
+    let status = response.status().as_u16();
+    if status == 401 || status == 403 || !(200..300).contains(&status) {
+        return Ok(RciJsonResponse {
+            status,
+            payload: None,
+        });
+    }
+
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|err| AppError::RciUnavailable(err.to_string()))?;
+
+    Ok(RciJsonResponse {
+        status,
+        payload: Some(payload),
+    })
+}
+
+fn build_resort_details_collection_url(base_url: &str) -> Result<String, AppError> {
+    let mut url = Url::parse(&format!("{}/details", base_url.trim_end_matches('/')))
+        .map_err(|err| AppError::RciUnavailable(format!("invalid resort details URL: {err}")))?;
+
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("ConsumerChannel", DEFAULT_CONSUMER_CHANNEL);
+        pairs.append_pair("MemberType", DEFAULT_MEMBER_TYPE_WEEKS);
+        pairs.append_pair("OperatorId", DEFAULT_OPERATOR_ID_WEEKS);
+    }
+
+    Ok(url.to_string())
+}
+
+fn build_resort_details_item_url(
+    base_url: &str,
+    resort_code: &str,
+    section: &str,
+    locale: Option<&str>,
+    member_type: &str,
+    operator_id: &str,
+) -> Result<String, AppError> {
+    let mut url = Url::parse(&format!(
+        "{}/{}/{}",
+        base_url.trim_end_matches('/'),
+        resort_code,
+        section
+    ))
+    .map_err(|err| {
+        AppError::RciUnavailable(format!("invalid resort details section URL: {err}"))
+    })?;
+
+    {
+        let mut pairs = url.query_pairs_mut();
+        if let Some(locale) = locale {
+            pairs.append_pair("locale", locale);
+        }
+        pairs.append_pair("ConsumerChannel", DEFAULT_CONSUMER_CHANNEL);
+        pairs.append_pair("MemberType", member_type);
+        pairs.append_pair("OperatorId", operator_id);
+    }
+
+    Ok(url.to_string())
+}
+
+fn inject_images_into_resort_details(resort_details: &mut Value, images: Value) {
+    if images.is_null() {
+        return;
+    }
+
+    if let Some(first_resort) = resort_details
+        .as_array_mut()
+        .and_then(|items| items.first_mut())
+        .and_then(Value::as_object_mut)
+    {
+        let current_count = first_resort
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let incoming_count = images.as_array().map(|items| items.len()).unwrap_or(0);
+        if incoming_count > current_count {
+            first_resort.insert("images".to_string(), images.clone());
+        } else {
+            first_resort
+                .entry("images".to_string())
+                .or_insert_with(|| images.clone());
+        }
+        return;
+    }
+
+    if let Some(object) = resort_details.as_object_mut() {
+        let current_count = object
+            .get("images")
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        let incoming_count = images.as_array().map(|items| items.len()).unwrap_or(0);
+        if incoming_count > current_count {
+            object.insert("images".to_string(), images.clone());
+        } else {
+            object
+                .entry("images".to_string())
+                .or_insert_with(|| images.clone());
+        }
+    }
+}
+
+fn parse_set_cookie(line: &str) -> Option<(String, String)> {
+    let first = line.split(';').next()?.trim();
+    let (name, value) = first.split_once('=')?;
+    Some((name.to_string(), value.to_string()))
 }
 
 fn build_header_map(session: &AuthenticatedSession) -> Result<HeaderMap, AppError> {
@@ -602,6 +1097,32 @@ fn build_resort_search_body(request: &ResortSearchRequest, customer_id: &str) ->
         "customerId": customer_id,
         "visibleNightlyRentalInv": false,
         "searchNightlyRentalInvSelected": false,
+        "selectedDepositTP": ""
+    })
+}
+
+fn build_resort_packages_body(
+    request: &ResortPackagesRequest,
+    customer_id: &str,
+    resort_code: &str,
+) -> Value {
+    json!({
+        "customerId": customer_id,
+        "exposedDimensions": ["CHECKIN_DATE"],
+        "filters": [format!("RSRT:{resort_code}")],
+        "productType": request.product_type.as_deref().unwrap_or("All"),
+        "searchCriteria": {
+            "distanceUnit": "",
+            "minStartDate": request.min_start_date.as_deref().unwrap_or(""),
+            "maxStartDate": request.max_start_date.as_deref().unwrap_or(""),
+            "onSaleInventory": false,
+            "preferredCheckInDate": "",
+            "resortSearchCriteria": [],
+            "youChoseFilters": [],
+            "minLoS": request.min_los.unwrap_or(1),
+            "maxLoS": request.max_los.unwrap_or(7)
+        },
+        "selectedDeposit": "",
         "selectedDepositTP": ""
     })
 }

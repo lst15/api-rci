@@ -8,6 +8,7 @@ pub struct Config {
     pub session_index_key: String,
     pub rci_validation_url: String,
     pub rci_resort_search_url: String,
+    pub rci_resort_details_base_url: String,
     pub rci_all_inclusive_resorts_url: String,
     pub rci_all_inclusive_unit_types_url: String,
     pub rci_all_inclusive_types_url: String,
@@ -31,6 +32,10 @@ impl Config {
             rci_resort_search_url: env_string(
                 "RCI_RESORT_SEARCH_URL",
                 "https://services.b2c.rci.com/ext/v1/resort-operations/v1/resorts/weeks/list-view",
+            ),
+            rci_resort_details_base_url: env_string(
+                "RCI_RESORT_DETAILS_BASE_URL",
+                "https://services.b2c.rci.com/ext/v1/prelogin/explore/resorts",
             ),
             rci_all_inclusive_resorts_url: env_string(
                 "RCI_ALL_INCLUSIVE_RESORTS_URL",

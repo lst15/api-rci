@@ -6,6 +6,8 @@ mod interfaces;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use application::get_resort_details::GetResortDetailsUseCase;
+use application::get_resort_packages::GetResortPackagesUseCase;
 use application::list_all_inclusive_resorts::ListAllInclusiveResortsUseCase;
 use application::quote_all_inclusive::QuoteAllInclusiveUseCase;
 use application::search_resorts::SearchResortsUseCase;
@@ -32,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rci_gateway = Arc::new(ReqwestRciGateway::new(
         config.rci_validation_url.clone(),
         config.rci_resort_search_url.clone(),
+        config.rci_resort_details_base_url.clone(),
         config.rci_all_inclusive_resorts_url.clone(),
         config.rci_all_inclusive_unit_types_url.clone(),
         config.rci_all_inclusive_types_url.clone(),
@@ -48,6 +51,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retry_policy,
     ));
     let search_resorts_use_case = Arc::new(SearchResortsUseCase::new(
+        session_repository.clone(),
+        rci_gateway.clone(),
+        retry_policy,
+    ));
+    let get_resort_details_use_case = Arc::new(GetResortDetailsUseCase::new(
+        session_repository.clone(),
+        rci_gateway.clone(),
+        retry_policy,
+    ));
+    let get_resort_packages_use_case = Arc::new(GetResortPackagesUseCase::new(
         session_repository,
         rci_gateway.clone(),
         retry_policy,
@@ -59,6 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(
         validate_session_use_case,
         search_resorts_use_case,
+        get_resort_details_use_case,
+        get_resort_packages_use_case,
         list_all_inclusive_resorts_use_case,
         quote_all_inclusive_use_case,
     );
